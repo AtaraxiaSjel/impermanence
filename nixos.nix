@@ -1,14 +1,44 @@
 { pkgs, config, lib, ... }:
 
 let
-  inherit (lib) attrNames attrValues zipAttrsWith flatten mkOption
-    types foldl' unique noDepEntry concatMapStrings listToAttrs
-    escapeShellArg escapeShellArgs replaceStrings recursiveUpdate all
-    filter filterAttrs concatStringsSep concatMapStringsSep isString
-    catAttrs optional literalExpression;
+  inherit (lib)
+    attrNames
+    attrValues
+    zipAttrsWith
+    flatten
+    mkOption
+    mkDefault
+    mapAttrsToList
+    types
+    foldl'
+    unique
+    concatMapStrings
+    listToAttrs
+    escapeShellArg
+    escapeShellArgs
+    recursiveUpdate
+    all
+    filter
+    filterAttrs
+    concatStringsSep
+    concatMapStringsSep
+    isString
+    catAttrs
+    optional
+    literalExpression
+    optionalString
+    elem
+    mapAttrs
+    ;
 
-  inherit (pkgs.callPackage ./lib.nix { }) splitPath dirListToPath
-    concatPaths sanitizeName duplicates;
+  inherit (pkgs.callPackage ./lib.nix { })
+    splitPath
+    dirListToPath
+    concatPaths
+    sanitizeName
+    duplicates
+    parentsOf
+    ;
 
   cfg = config.environment.persistence;
   users = config.users.users;
@@ -21,10 +51,10 @@ let
   '';
 
   # Create fileSystems bind mount entry.
-  mkBindMountNameValuePair = { directory, persistentStoragePath, ... }: {
-    name = concatPaths [ "/" directory ];
+  mkBindMountNameValuePair = { dirPath, persistentStoragePath, ... }: {
+    name = concatPaths [ "/" dirPath ];
     value = {
-      device = concatPaths [ persistentStoragePath directory ];
+      device = concatPaths [ persistentStoragePath dirPath ];
       noCheck = true;
       options = [ "bind" ]
         ++ optional cfg.${persistentStoragePath}.hideMounts "x-gvfs-hide";
@@ -42,7 +72,17 @@ in
       default = { };
       type =
         let
-          inherit (types) attrsOf bool listOf submodule path either str;
+          inherit (types)
+            attrsOf
+            bool
+            listOf
+            submodule
+            nullOr
+            path
+            either
+            str
+            coercedTo
+            ;
         in
         attrsOf (
           submodule (
@@ -64,12 +104,20 @@ in
                       file should be stored.
                     '';
                   };
+                  home = mkOption {
+                    type = nullOr path;
+                    default = null;
+                    internal = true;
+                    description = ''
+                      The path to the home directory the file is
+                      placed within.
+                    '';
+                  };
                 };
               };
-              dirPermsOpts = { user, group, mode }: {
+              dirPermsOpts = {
                 user = mkOption {
                   type = str;
-                  default = user;
                   description = ''
                     If the directory doesn't exist in persistent
                     storage it will be created and owned by the user
@@ -78,7 +126,6 @@ in
                 };
                 group = mkOption {
                   type = str;
-                  default = group;
                   description = ''
                     If the directory doesn't exist in persistent
                     storage it will be created and owned by the
@@ -87,7 +134,6 @@ in
                 };
                 mode = mkOption {
                   type = str;
-                  default = mode;
                   example = "0700";
                   description = ''
                     If the directory doesn't exist in persistent
@@ -96,7 +142,7 @@ in
                   '';
                 };
               };
-              fileOpts = perms: {
+              fileOpts = {
                 options = {
                   file = mkOption {
                     type = str;
@@ -104,10 +150,17 @@ in
                       The path to the file.
                     '';
                   };
-                  parentDirectory = dirPermsOpts perms;
+                  parentDirectory = dirPermsOpts // {
+                    # See comment in dirOpts below for an explanation.
+                    defaultPerms = mapAttrs (_: x: x // { internal = true; }) dirPermsOpts;
+                  };
+                  filePath = mkOption {
+                    type = path;
+                    internal = true;
+                  };
                 };
               };
-              dirOpts = perms: {
+              dirOpts = {
                 options = {
                   directory = mkOption {
                     type = str;
@@ -115,16 +168,34 @@ in
                       The path to the directory.
                     '';
                   };
-                } // (dirPermsOpts perms);
+                  # Save the default permissions at the level the
+                  # directory resides. This used when creating its
+                  # parent directories, giving them reasonable
+                  # default permissions unaffected by the
+                  # directory's own.
+                  defaultPerms = mapAttrs (_: x: x // { internal = true; }) dirPermsOpts;
+                  dirPath = mkOption {
+                    type = path;
+                    internal = true;
+                  };
+                } // dirPermsOpts;
               };
               rootFile = submodule [
                 commonOpts
-                (fileOpts defaultPerms)
+                fileOpts
+                ({ config, ... }: {
+                  parentDirectory = mkDefault (defaultPerms // { inherit defaultPerms; });
+                  filePath = mkDefault config.file;
+                })
               ];
-              rootDir = submodule [
+              rootDir = submodule ([
                 commonOpts
-                (dirOpts defaultPerms)
-              ];
+                dirOpts
+                ({ config, ... }: {
+                  defaultPerms = mkDefault defaultPerms;
+                  dirPath = mkDefault config.directory;
+                })
+              ] ++ (mapAttrsToList (n: v: { ${n} = mkDefault v; }) defaultPerms));
             in
             {
               options =
@@ -139,14 +210,38 @@ in
                             user = name;
                             group = users.${userDefaultPerms.user}.group;
                           };
+                          fileConfig =
+                            { config, ... }:
+                            {
+                              parentDirectory = mkDefault (userDefaultPerms // { defaultPerms = userDefaultPerms; });
+                              filePath =
+                                if config.home != null then
+                                  concatPaths [ config.home config.file ]
+                                else
+                                  config.file;
+                            };
                           userFile = submodule [
                             commonOpts
-                            (fileOpts userDefaultPerms)
+                            fileOpts
+                            { inherit (config) home; }
+                            fileConfig
                           ];
-                          userDir = submodule [
+                          dirConfig =
+                            { config, ... }:
+                            {
+                              defaultPerms = mkDefault userDefaultPerms;
+                              dirPath =
+                                if config.home != null then
+                                  concatPaths [ config.home config.directory ]
+                                else
+                                  config.directory;
+                            };
+                          userDir = submodule ([
                             commonOpts
-                            (dirOpts userDefaultPerms)
-                          ];
+                            dirOpts
+                            { inherit (config) home; }
+                            dirConfig
+                          ] ++ (mapAttrsToList (n: v: { ${n} = mkDefault v; }) userDefaultPerms));
                         in
                         {
                           options =
@@ -168,8 +263,9 @@ in
                                   nixpkgs.
                                 '';
                               };
+
                               files = mkOption {
-                                type = listOf (either str userFile);
+                                type = listOf (coercedTo str (f: { file = f; }) userFile);
                                 default = [ ];
                                 example = [
                                   ".screenrc"
@@ -178,22 +274,10 @@ in
                                   Files that should be stored in
                                   persistent storage.
                                 '';
-                                apply =
-                                  map (file:
-                                    if isString file then
-                                      {
-                                        inherit persistentStoragePath;
-                                        file = concatPaths [ config.home file ];
-                                        parentDirectory = userDefaultPerms;
-                                      }
-                                    else
-                                      file // {
-                                        file = concatPaths [ config.home file.file ];
-                                      });
                               };
 
                               directories = mkOption {
-                                type = listOf (either str userDir);
+                                type = listOf (coercedTo str (d: { directory = d; }) userDir);
                                 default = [ ];
                                 example = [
                                   "Downloads"
@@ -206,17 +290,6 @@ in
                                   Directories to bind mount to
                                   persistent storage.
                                 '';
-                                apply =
-                                  map (directory:
-                                    if isString directory then
-                                      userDefaultPerms // {
-                                        directory = concatPaths [ config.home directory ];
-                                        inherit persistentStoragePath;
-                                      }
-                                    else
-                                      directory // {
-                                        directory = concatPaths [ config.home directory.directory ];
-                                      });
                               };
                             };
                         }
@@ -259,7 +332,7 @@ in
                   };
 
                   files = mkOption {
-                    type = listOf (either str rootFile);
+                    type = listOf (coercedTo str (f: { file = f; }) rootFile);
                     default = [ ];
                     example = [
                       "/etc/machine-id"
@@ -268,19 +341,10 @@ in
                     description = ''
                       Files that should be stored in persistent storage.
                     '';
-                    apply =
-                      map (file:
-                        if isString file then
-                          {
-                            inherit file persistentStoragePath;
-                            parentDirectory = defaultPerms;
-                          }
-                        else
-                          file);
                   };
 
                   directories = mkOption {
-                    type = listOf (either str rootDir);
+                    type = listOf (coercedTo str (d: { directory = d; }) rootDir);
                     default = [ ];
                     example = [
                       "/var/log"
@@ -291,14 +355,6 @@ in
                     description = ''
                       Directories to bind mount to persistent storage.
                     '';
-                    apply =
-                      map (directory:
-                        if isString directory then
-                          defaultPerms // {
-                            inherit directory persistentStoragePath;
-                          }
-                        else
-                          directory);
                   };
 
                   hideMounts = mkOption {
@@ -371,10 +427,10 @@ in
   config = {
     systemd.services =
       let
-        mkPersistFileService = { file, persistentStoragePath, ... }:
+        mkPersistFileService = { filePath, persistentStoragePath, ... }:
           let
-            targetFile = escapeShellArg (concatPaths [ persistentStoragePath file ]);
-            mountPoint = escapeShellArg file;
+            targetFile = escapeShellArg (concatPaths [ persistentStoragePath filePath ]);
+            mountPoint = escapeShellArg filePath;
             enableDebugging = escapeShellArg cfg.${persistentStoragePath}.enableDebugging;
           in
           {
@@ -417,11 +473,11 @@ in
           patchShebangs $out
         '';
 
-        mkDirWithPerms = { directory, persistentStoragePath, user, group, mode }:
+        mkDirWithPerms = { dirPath, persistentStoragePath, user, group, mode, ... }:
           let
             args = [
               persistentStoragePath
-              directory
+              dirPath
               user
               group
               mode
@@ -436,26 +492,110 @@ in
         # storage directories we want to bind mount.
         dirCreationScript =
           let
-            inherit directories;
-            fileDirectories = unique (map
+            # The parent directories of files.
+            fileDirs = unique (map
               (f:
-                {
+                rec {
                   directory = dirOf f.file;
-                  inherit (f) persistentStoragePath;
+                  dirPath =
+                    if f.home != null then
+                      concatPaths [ f.home directory ]
+                    else
+                      directory;
+                  inherit (f) persistentStoragePath home;
                 } // f.parentDirectory)
               files);
+
+            # All the directories actually listed by the user and the
+            # parent directories of listed files.
+            explicitDirs = directories ++ fileDirs;
+
+            # Home directories have to be handled specially, since
+            # they're at the permissions boundary where they
+            # themselves should be owned by the user and have stricter
+            # permissions than regular directories, whereas its parent
+            # should be owned by root and have regular permissions.
+            #
+            # This simply collects all the home directories and sets
+            # the appropriate permissions and ownership.
+            homeDirs =
+              foldl'
+                (state: dir:
+                  let
+                    defaultPerms = {
+                      mode = "0755";
+                      user = "root";
+                      group = "root";
+                    };
+                    homeDir = {
+                      directory = dir.home;
+                      dirPath = dir.home;
+                      home = null;
+                      mode = "0700";
+                      user = dir.user;
+                      group = users.${dir.user}.group;
+                      inherit defaultPerms;
+                      inherit (dir) persistentStoragePath;
+                    };
+                  in
+                  if dir.home != null then
+                    if !(elem homeDir state) then
+                      state ++ [ homeDir ]
+                    else
+                      state
+                  else
+                    state)
+                [ ]
+                explicitDirs;
+
+            # Generate entries for all parent directories of the
+            # argument directories, listed in the order they need to
+            # be created. The parent directories are assigned default
+            # permissions.
+            mkParentDirs = dirs:
+              let
+                # Create a new directory item from `dir`, the child
+                # directory item to inherit properties from and
+                # `path`, the parent directory path.
+                mkParent = dir: path: {
+                  directory = path;
+                  dirPath =
+                    if dir.home != null then
+                      concatPaths [ dir.home path ]
+                    else
+                      path;
+                  inherit (dir) persistentStoragePath home;
+                  inherit (dir.defaultPerms) user group mode;
+                };
+                # Create new directory items for all parent
+                # directories of a directory.
+                mkParents = dir:
+                  map (mkParent dir) (parentsOf dir.directory);
+              in
+              unique (flatten (map mkParents dirs));
+
+            # Parent directories of home folders. This is usually only
+            # /home, unless the user's home is in a non-standard
+            # location.
+            homeDirParents = mkParentDirs homeDirs;
+
+            # Parent directories of all explicitly listed directories.
+            parentDirs = mkParentDirs explicitDirs;
+
+            # All directories in the order they should be created.
+            allDirs = homeDirParents ++ homeDirs ++ parentDirs ++ explicitDirs;
           in
           pkgs.writeShellScript "impermanence-run-create-directories" ''
             _status=0
             trap "_status=1" ERR
-            ${concatMapStrings mkDirWithPerms (directories ++ fileDirectories)}
+            ${concatMapStrings mkDirWithPerms allDirs}
             exit $_status
           '';
 
-        mkPersistFile = { file, persistentStoragePath, ... }:
+        mkPersistFile = { filePath, persistentStoragePath, ... }:
           let
-            mountPoint = file;
-            targetFile = concatPaths [ persistentStoragePath file ];
+            mountPoint = filePath;
+            targetFile = concatPaths [ persistentStoragePath filePath ];
             args = escapeShellArgs [
               mountPoint
               targetFile
